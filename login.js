@@ -1,5 +1,7 @@
 require("dotenv").config();
 const { chromium } = require("playwright");
+const tls = require("tls");
+const url = require("url");
 
 // プロジェクト自動作成処理（tryの外に定義）
 async function createProject(page, projectName) {
@@ -32,6 +34,17 @@ async function createProject(page, projectName) {
       })
       .catch(() => {});
     await page.waitForTimeout(500);
+
+    // 既にCIテストプロジェクトが存在するかチェック
+    await page.waitForTimeout(1000); // 一覧描画待ち
+    const exists = await page.locator(`text=${projectName}`).count();
+    if (exists > 0) {
+      console.log(
+        `既に${projectName}プロジェクトが存在するため作成をスキップします。`
+      );
+      return;
+    }
+
     // 「新しいプロジェクトを作成」ボタンを探してクリック
     const createBtn = await page.locator(
       'button.btn-info.pull-right:has-text("新しいプロジェクトを作成")'
@@ -187,6 +200,28 @@ async function openProjectDetail(page, projectName) {
   }
 }
 
+// ドメインごとのSSL証明書有効期限チェック
+async function checkSSLCertExpiry(targetUrl) {
+  return new Promise((resolve, reject) => {
+    const { hostname, port } = url.parse(targetUrl);
+    const socket = tls.connect(
+      port || 443,
+      hostname,
+      { servername: hostname },
+      () => {
+        const cert = socket.getPeerCertificate();
+        if (cert && cert.valid_to) {
+          resolve(cert.valid_to); // 例: 'Jul  7 23:59:59 2025 GMT'
+        } else {
+          reject("証明書情報が取得できませんでした");
+        }
+        socket.end();
+      }
+    );
+    socket.on("error", reject);
+  });
+}
+
 (async () => {
   const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext();
@@ -339,6 +374,43 @@ async function openProjectDetail(page, projectName) {
     links = Array.from(allLinks.values());
     console.log("全ての階層のリンク一覧:");
     links.forEach((link) => console.log(link));
+
+    // === ここからSSL証明書有効期限チェック ===
+    const checkedDomains = new Set();
+    for (const link of links) {
+      if (!link.href) continue;
+      let targetUrl = link.href;
+      if (targetUrl.startsWith("/")) {
+        targetUrl = "https://dev.ntmatrix.app" + targetUrl;
+      } else if (!targetUrl.startsWith("http")) {
+        continue;
+      }
+      const { hostname } = url.parse(targetUrl);
+      if (!hostname || checkedDomains.has(hostname)) continue;
+      checkedDomains.add(hostname);
+      try {
+        const validTo = await checkSSLCertExpiry(targetUrl);
+        const expiryDate = new Date(validTo);
+        const now = new Date();
+        const diffDays = Math.floor((expiryDate - now) / (1000 * 60 * 60 * 24));
+        if (diffDays < 0) {
+          console.log(
+            `【警告】証明書が期限切れです: ${hostname} (有効期限: ${validTo})`
+          );
+        } else if (diffDays < 30) {
+          console.log(
+            `【警告】証明書の有効期限が30日未満です: ${hostname} (有効期限: ${validTo})`
+          );
+        } else {
+          console.log(
+            `証明書有効期限: ${hostname} → ${validTo}（残り${diffDays}日）`
+          );
+        }
+      } catch (e) {
+        console.log(`証明書情報取得失敗: ${hostname} (${e})`);
+      }
+    }
+    // === ここまで ===
 
     // プロジェクト自動作成処理は必ず実行
     await createProject(page, "CIテスト");
