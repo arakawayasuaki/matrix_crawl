@@ -34,6 +34,9 @@ function hasFlag(flag) {
 const CHECKLIST_MODE =
   hasFlag("--checklist") ||
   String(process.env.NTMATRIX_CHECKLIST || "") === "1";
+const CHECKLIST_DETAILS =
+  hasFlag("--checklist-details") ||
+  String(process.env.NTMATRIX_CHECKLIST_DETAILS || "") === "1";
 
 function formatForLog(x) {
   if (typeof x === "string") return x;
@@ -61,7 +64,15 @@ function setupChecklistMode() {
 
 function emitChecklist(item, ok) {
   if (!CHECKLIST_MODE) return;
-  process.stdout.write(`${item}\t${ok ? "OK" : "NG"}\n`);
+  const status = ok ? "OK" : "NG";
+  if (!CHECKLIST_DETAILS) {
+    process.stdout.write(`${item}\t${status}\n`);
+    return;
+  }
+  const desc = describeChecklistItem(item)
+    .replace(/\r?\n/g, " ")
+    .replace(/\t/g, " ");
+  process.stdout.write(`${item}\t${status}\t${desc}\n`);
 }
 
 function emitChecklistFromSteps(prefix, steps) {
@@ -78,6 +89,63 @@ function safeChecklistKey(s, maxLen = 140) {
     .replace(/\s+/g, "_")
     .replace(/[^\w.\-:@/]+/g, "_")
     .slice(0, maxLen);
+}
+
+function describeChecklistItem(key) {
+  const fixed = {
+    login: "ログイン状態を確認（必要なら手動ログイン/StorageState更新）",
+    behavior_smoke:
+      "デザイナー動作スモーク（入力2つ配置・プロパティ編集・プレビュー入力・DataModelバインド）",
+    test_all_components:
+      "全コンポーネントを列挙して1つずつドラッグ&ドロップ→DOM増加を確認→Undoで後片付け",
+    link_check:
+      "画面内リンクを巡回し、HTTPステータス>=400等のリンク切れが無いことを確認",
+    chinese_check:
+      "各メニューの右側メインコンテンツに中国語（漢字レンジ）混入が無いことを確認",
+  };
+  if (fixed[key]) return fixed[key];
+
+  if (key.startsWith("behavior_smoke.")) {
+    const step = key.slice("behavior_smoke.".length);
+    const map = {
+      ci_datamodel_create:
+        "CI専用DataModelを作成（テスト用にのみ使用し、終了時に削除）",
+      designer_ready: "デザイナーキャンバス(#rendererContent)の表示を確認",
+      drop_two_inputs:
+        "入力ボックス(input)を2つキャンバスへ配置（要素数増加で判定）",
+      set_first_input_props: "1つ目の入力にプロパティ（タイトル等）を設定",
+      set_second_input_props: "2つ目の入力にプロパティ（タイトル等）を設定",
+      datamodel_bind:
+        "デザイナーのDataModel設定で作成したCI DataModelを選択してバインド",
+      designer_title_reflect:
+        "デザイナー上でタイトル(Name/Age)がキャンバスに反映されたことを確認",
+      designer_toolbar_preview_type:
+        "デザイナーツールバーのプレビュー(eye-slash)で入力できることを確認",
+      preview_type:
+        "プレビュー画面でName/Ageに入力でき、表示反映されることを確認",
+      ci_datamodel_delete:
+        "CI専用DataModelを削除（作成したIDのみ削除・他は削除しない）",
+    };
+    if (map[step]) return map[step];
+    return `behavior_smoke のステップ: ${step}`;
+  }
+
+  if (key.startsWith("component.")) {
+    const name = key.slice("component.".length);
+    return `コンポーネント「${name}」をキャンバスへドラッグ&ドロップして配置できることを確認（Undoで戻す）`;
+  }
+
+  if (key.startsWith("link_broken.")) {
+    const href = key.slice("link_broken.".length);
+    return `リンク切れ検出: ${href}`;
+  }
+
+  if (key.startsWith("chinese.")) {
+    const menu = key.slice("chinese.".length);
+    return `中国語混入検出（右側コンテンツ）: ${menu}`;
+  }
+
+  return "";
 }
 
 function parseCookieHeader(cookieHeader) {
