@@ -73,6 +73,13 @@ function emitChecklistFromSteps(prefix, steps) {
   }
 }
 
+function safeChecklistKey(s, maxLen = 140) {
+  return String(s || "")
+    .replace(/\s+/g, "_")
+    .replace(/[^\w.\-:@/]+/g, "_")
+    .slice(0, maxLen);
+}
+
 function parseCookieHeader(cookieHeader) {
   // "a=b; c=d" -> [{ name:"a", value:"b", url: BASE_URL }, ...]
   return cookieHeader
@@ -2713,6 +2720,7 @@ async function waitForManualLogin(page, timeoutMs) {
 
   // サイドバーのリンク一覧を取得
   let links = [];
+  const chineseFindings = [];
   try {
     await page.waitForSelector(".px-nav-content .px-nav-item", {
       timeout: 20000,
@@ -2768,13 +2776,19 @@ async function waitForManualLogin(page, timeoutMs) {
         .catch(() => "");
       if (/[\u4e00-\u9fff]/.test(mainContentText)) {
         console.log(`中国語が含まれています（右側コンテンツ）: ${menuText}`);
+        chineseFindings.push({ menuText, where: "main_content" });
       }
 
       // 詳細画面に遷移したらクロールを即時終了
       if (page.url().includes("/project?s=")) {
-        console.log("詳細画面に遷移したため、クロールを終了します。");
-        await browser.close();
-        process.exit(0);
+        console.log(
+          "詳細画面に遷移したため、このメニューのクロールをスキップします。"
+        );
+        await page
+          .goto(baseUrl, { waitUntil: "domcontentloaded" })
+          .catch(() => {});
+        await page.waitForLoadState("networkidle").catch(() => {});
+        return;
       }
       // 「プロジェクト」以外は右側リンクをクロール
       if (menuText !== "プロジェクト") {
@@ -2952,6 +2966,16 @@ async function waitForManualLogin(page, timeoutMs) {
     });
   } else {
     console.log("\nリンク切れはありませんでした。");
+  }
+
+  // checklist items (stdout only): overall + failures only
+  emitChecklist("link_check", brokenLinks.length === 0);
+  for (const bl of brokenLinks) {
+    emitChecklist(`link_broken.${safeChecklistKey(bl.href)}`, false);
+  }
+  emitChecklist("chinese_check", chineseFindings.length === 0);
+  for (const cf of chineseFindings) {
+    emitChecklist(`chinese.${safeChecklistKey(cf.menuText)}`, false);
   }
 
   // ブラウザを閉じてプロセスを終了
