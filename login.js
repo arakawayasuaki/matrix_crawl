@@ -1046,10 +1046,10 @@ async function testBehaviorSmoke(page) {
         .click({ force: true })
         .catch(() => {});
       // Set properties: id/name/タイトル -> Name
+      // NOTE: inputによってはid/nameプロパティが存在しないため、見つからなければスキップ
       await editComponentProperty(page, "id", "Name").catch(() => {});
       await editComponentProperty(page, "name", "Name").catch(() => {});
       await editComponentProperty(page, "タイトル", "Name").catch(() => {});
-      await editComponentProperty(page, "title", "Name").catch(() => {});
       result.steps.push({ step: "set_first_input_props", ok: true });
     } else {
       result.steps.push({
@@ -1068,7 +1068,6 @@ async function testBehaviorSmoke(page) {
       await editComponentProperty(page, "id", "Age").catch(() => {});
       await editComponentProperty(page, "name", "Age").catch(() => {});
       await editComponentProperty(page, "タイトル", "Age").catch(() => {});
-      await editComponentProperty(page, "title", "Age").catch(() => {});
       result.steps.push({ step: "set_second_input_props", ok: true });
     } else {
       result.steps.push({
@@ -2279,6 +2278,7 @@ async function checkSSLCertExpiry(targetUrl) {
 }
 
 // Helper to edit component properties in the right sidebar
+// Returns true if a matching property input was found and we attempted to set it.
 async function editComponentProperty(page, propertyLabel, value) {
   try {
     // There might be multiple sidebars sharing this class.
@@ -2289,14 +2289,24 @@ async function editComponentProperty(page, propertyLabel, value) {
       .last();
     await sidebar.waitFor({ state: "visible", timeout: 5000 });
 
-    // Try to find the specific label
-    // Debug: Print all available labels
-    const allLabels = await sidebar.locator(".title label").allInnerTexts();
-    console.log("DEBUG: Available Properties in Sidebar:", allLabels);
+    const shouldDebug = hasFlag("--debug-properties");
+
+    const synonyms = {
+      title: ["タイトル", "Title", "表示名", "ラベル", "項目名"],
+      タイトル: ["Title", "title", "表示名", "ラベル", "項目名"],
+      id: ["ID", "Id", "識別子", "キー"],
+      name: ["Name", "名称", "名前"],
+    };
+
+    const candidates = [propertyLabel, ...(synonyms[propertyLabel] || [])];
 
     let label = sidebar
-      .locator(`.title label:has-text("${propertyLabel}")`)
+      .locator(`.title label:has-text("${candidates[0]}")`)
       .first();
+    for (const c of candidates) {
+      label = sidebar.locator(`.title label:has-text("${c}")`).first();
+      if ((await label.count()) > 0) break;
+    }
 
     if ((await label.count()) === 0) {
       console.log(
@@ -2304,6 +2314,26 @@ async function editComponentProperty(page, propertyLabel, value) {
       );
       const allLabels = await sidebar.locator(".title label").allInnerTexts();
       console.log("Available Properties:", allLabels);
+
+      // id/name はコンポーネントによっては存在しない。挙動テストではスキップ扱いにする。
+      if (propertyLabel === "id" || propertyLabel === "name") {
+        console.log(
+          `Skipping "${propertyLabel}" because it does not exist in this component properties.`
+        );
+        return false;
+      }
+
+      if (propertyLabel === "title") {
+        console.log("Trying to find 'タイトル' or similar...");
+        const fallbacks = ["タイトル", "表示名", "ラベル", "項目名", "Title"];
+        for (const fb of fallbacks) {
+          label = sidebar.locator(`.title label:has-text("${fb}")`).first();
+          if ((await label.count()) > 0) {
+            console.log(`Found fallback property: ${fb}`);
+            break;
+          }
+        }
+      }
 
       if (propertyLabel === "テキスト") {
         console.log("Trying to find 'Text' or 'Value' or similar...");
@@ -2333,7 +2363,7 @@ async function editComponentProperty(page, propertyLabel, value) {
             await firstInput.click();
             await firstInput.fill(value);
             await firstInput.press("Enter");
-            return;
+            return true;
           }
         }
       }
@@ -2370,6 +2400,12 @@ async function editComponentProperty(page, propertyLabel, value) {
         console.log(
           `Found input for "${propertyLabel}". Filling with "${value}"...`
         );
+        if (shouldDebug) {
+          const allLabels = await sidebar
+            .locator(".title label")
+            .allInnerTexts();
+          console.log("DEBUG: Available Properties in Sidebar:", allLabels);
+        }
         // Try clicking the parent wrapper first, as the input itself might be hidden/overlayed
         const wrapper = nextInput.locator("xpath=..");
         if (await wrapper.isVisible()) {
@@ -2390,15 +2426,59 @@ async function editComponentProperty(page, propertyLabel, value) {
         }, value);
 
         await page.waitForTimeout(500);
+        return true;
       } else {
         console.error(`Input field for "${propertyLabel}" not found.`);
+        return false;
       }
     }
 
     await page.waitForTimeout(1000);
+    return false;
   } catch (e) {
     console.error(`Error editing property "${propertyLabel}":`, e);
+    return false;
   }
+}
+
+async function isProbablyLoggedIn(page) {
+  try {
+    const u = page.url();
+    if (u.includes("/login") || u.includes("/loginDev")) return false;
+    // Logged-in shell typically has left nav items
+    const navCount = await page
+      .locator(".px-nav-content .px-nav-item")
+      .count()
+      .catch(() => 0);
+    if (navCount > 0) return true;
+    // Fallback: if login form fields are present, treat as not logged in
+    const loginFieldCount = await page
+      .locator('input[placeholder*="メール形式"], text=認証コード')
+      .count()
+      .catch(() => 0);
+    return loginFieldCount === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForManualLogin(page, timeoutMs) {
+  const start = Date.now();
+  let lastLogAt = 0;
+  while (Date.now() - start < timeoutMs) {
+    if (await isProbablyLoggedIn(page)) return true;
+    const elapsed = Date.now() - start;
+    if (elapsed - lastLogAt > 10000) {
+      console.log(
+        `ログイン待機中...（経過${Math.floor(
+          elapsed / 1000
+        )}秒, url=${page.url()}）`
+      );
+      lastLogAt = elapsed;
+    }
+    await page.waitForTimeout(500).catch(() => {});
+  }
+  return false;
 }
 
 (async () => {
@@ -2407,8 +2487,25 @@ async function editComponentProperty(page, propertyLabel, value) {
   const homeUrl = `${baseUrl}/`;
   const headless = hasFlag("--headless");
   const interactive = hasFlag("--interactive"); // 明示的に指定された場合のみ対話待ちする
+  const isCI = String(process.env.CI || "").toLowerCase() === "true";
+  const loginWaitSeconds = Number(getArg("--login-wait-seconds") || 600);
+  const loginWaitMs = Number.isFinite(loginWaitSeconds)
+    ? Math.max(5, loginWaitSeconds) * 1000
+    : 600000;
 
-  const browser = await chromium.launch({ headless });
+  // CI/自動テストとして実行されているか（ログインが必要なら fail させたい）
+  const isTestModeRequested =
+    hasFlag("--test-all-components") ||
+    hasFlag("--behavior-smoke") ||
+    hasFlag("--behavior-commit") ||
+    hasFlag("--behavior-strict-commit") ||
+    hasFlag("--behavior-datamodel") ||
+    hasFlag("--behavior-strict-datamodel") ||
+    hasFlag("--behavior-datamodel-bind") ||
+    hasFlag("--behavior-strict-datamodel-bind") ||
+    hasFlag("--ci-datamodel");
+
+  let browser = await chromium.launch({ headless });
 
   // StorageStateの読み込み設定
   let contextOptions = {};
@@ -2420,7 +2517,7 @@ async function editComponentProperty(page, propertyLabel, value) {
       console.log("StorageStateの読み込みに失敗しました:", e);
     }
   }
-  const context = await browser.newContext(contextOptions);
+  let context = await browser.newContext(contextOptions);
   // StorageStateが無い場合のみ、保持Cookieを注入してログイン復元を試みる
   if (!contextOptions.storageState) {
     try {
@@ -2430,7 +2527,7 @@ async function editComponentProperty(page, propertyLabel, value) {
     }
   }
 
-  const page = await context.newPage();
+  let page = await context.newPage();
 
   // ログイン状態確認（トップページにアクセスしてみる）
   await page.goto(homeUrl);
@@ -2457,24 +2554,81 @@ async function editComponentProperty(page, propertyLabel, value) {
     await page.waitForLoadState("networkidle");
     await dumpPageArtifacts(page, "login");
 
-    // headless かつ interactive 指定が無い場合、ここで終了（CI/自動調査向け）
+    // headless かつ interactive 指定が無い場合:
+    // - CIでは入力待ちできないため失敗扱いで終了
+    // - ローカル/手元実行では、自動でブラウザ(表示あり)を開いて手動ログイン→storage更新→続行
     if (headless && !interactive) {
+      if (isCI) {
+        console.log(
+          "headless でログインが必要なため終了します。Cookie/StorageStateを渡すか、--interactive を付けて手動ログインしてください。"
+        );
+        if (isTestModeRequested) {
+          console.error(
+            "CI(非対話)でテストモード実行中にログインが必要になったため失敗扱いにします（exitCode=1）。storage.json を更新して再実行してください。"
+          );
+          process.exitCode = 1;
+        }
+        await browser.close().catch(() => {});
+        return;
+      }
+
       console.log(
-        "headless でログインが必要なため終了します。Cookie/StorageStateを渡すか、--interactive を付けて手動ログインしてください。"
+        "Cookie/StorageStateが失効しているため、ブラウザ(表示あり)を開いて手動ログインに切り替えます。ログイン完了を自動検知してstorage.jsonを保存します。"
       );
+
+      // headless で開いたブラウザは閉じ、headed で再起動して同一実行で継続する
       await browser.close().catch(() => {});
-      return;
+      browser = await chromium.launch({ headless: false });
+      context = await browser.newContext(contextOptions);
+      if (!contextOptions.storageState) {
+        try {
+          await applyCookiesToContext(context, baseUrl);
+        } catch (e) {
+          console.log("Cookieの適用に失敗しました:", e?.message || e);
+        }
+      }
+      page = await context.newPage();
+
+      await page.goto(loginUrl);
+      await page.waitForLoadState("networkidle");
+      await dumpPageArtifacts(page, "login_interactive");
+
+      // ログイン完了を自動検知できた場合のみ storage を保存（未ログインで上書きしない）
+      const ok = await waitForManualLogin(page, loginWaitMs);
+      if (!ok) {
+        console.error(
+          "ログイン完了を確認できませんでした（timeout）。storage.json は更新せずに終了します。"
+        );
+        process.exitCode = 1;
+        await browser.close().catch(() => {});
+        return;
+      }
+      await context.storageState({ path: STORAGE_STATE_PATH });
+      console.log("StorageStateを保存しました。");
+
+      // トップページに遷移（念のため）
+      if (!page.url().includes(homeUrl) || page.url().includes("/login")) {
+        await page.goto(homeUrl);
+        await page.waitForLoadState("networkidle");
+      }
+      // 以降はこの headed セッションで続行
     }
 
     // ユーザーが手動でログインするのを待つ
     console.log(
-      "手動でログインしてください。ログイン後、Enterキーを押してください。"
+      "手動でログインしてください。ログイン完了を自動検知してstorage.jsonを保存します。"
     );
-    await new Promise((resolve) => {
-      process.stdin.once("data", () => resolve());
-    });
 
     // ログイン成功後、StorageStateを保存
+    const ok = await waitForManualLogin(page, loginWaitMs);
+    if (!ok) {
+      console.error(
+        "ログイン完了を確認できませんでした（timeout）。storage.json は更新せずに終了します。"
+      );
+      process.exitCode = 1;
+      await browser.close().catch(() => {});
+      return;
+    }
     await context.storageState({ path: STORAGE_STATE_PATH });
     console.log("StorageStateを保存しました。");
 
