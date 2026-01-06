@@ -94,6 +94,10 @@ function safeChecklistKey(s, maxLen = 140) {
 function describeChecklistItem(key) {
   const fixed = {
     login: "ログイン状態を確認（必要なら手動ログイン/StorageState更新）",
+    ci_project_create:
+      "CI用プロジェクトを作成（この実行で作成したものだけを終了時に削除）",
+    ci_project_delete:
+      "CI用プロジェクトを削除（名称/IDの一致を確認し、他のプロジェクトは削除しない）",
     behavior_smoke:
       "デザイナー動作スモーク（入力2つ配置・プロパティ編集・プレビュー入力・DataModelバインド）",
     test_all_components:
@@ -1679,6 +1683,384 @@ async function applyCookiesToContext(context, baseUrl) {
   return false;
 }
 
+function parseProjectIdFromProgramManagementHref(href, baseUrl) {
+  try {
+    if (!href) return null;
+    const u = href.startsWith("http") ? new URL(href) : new URL(href, baseUrl);
+    const sParam = u.searchParams.get("s");
+    if (!sParam) return null;
+    const decodedS = Buffer.from(sParam, "base64").toString("utf8");
+    const params = new URLSearchParams(decodedS);
+    const pid = params.get("pid") || params.get("oid") || null;
+    if (!pid) return null;
+    // Expect snowflake-like numeric id. If not numeric, treat as unknown.
+    if (!/^\d{8,}$/.test(String(pid))) return null;
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+function parseProjectIdFromSParamUrl(u, baseUrl) {
+  try {
+    const urlObj = u.startsWith("http") ? new URL(u) : new URL(u, baseUrl);
+    const sParam = urlObj.searchParams.get("s");
+    if (!sParam) return null;
+    const decodedS = Buffer.from(sParam, "base64").toString("utf8");
+    const params = new URLSearchParams(decodedS);
+    const pid = params.get("pid") || params.get("oid") || null;
+    if (!pid) return null;
+    if (!/^\d{8,}$/.test(String(pid))) return null;
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
+async function goToProjectList(page) {
+  // Navigate to "プロジェクト" list via left nav.
+  const projectMenuHandles = await page
+    .locator('xpath=//li[contains(., "プロジェクト")]')
+    .elementHandles();
+  if (projectMenuHandles.length === 0) return false;
+
+  let clicked = false;
+  const aTag = await projectMenuHandles[0].$("a");
+  if (aTag) {
+    await aTag.click().catch(() => {});
+    clicked = true;
+  } else {
+    const btn = await projectMenuHandles[0].$("button");
+    if (btn) {
+      await btn.click().catch(() => {});
+      clicked = true;
+    }
+  }
+  if (!clicked) await projectMenuHandles[0].click().catch(() => {});
+  await page.waitForTimeout(800);
+  await page.waitForLoadState("domcontentloaded").catch(() => {});
+  await page.waitForLoadState("networkidle").catch(() => {});
+  // Best-effort: wait for "create project" button (or similar) to confirm list is ready
+  await page
+    .waitForSelector('button:has-text("新しいプロジェクトを作成")', {
+      timeout: 8000,
+    })
+    .catch(() => {});
+  return true;
+}
+
+async function findProjectRowHandle(page, projectName) {
+  const projectElement = page.locator(`text=${projectName}`).first();
+  if ((await projectElement.count().catch(() => 0)) === 0) return null;
+  const rowHandle = await projectElement
+    .evaluateHandle((el) =>
+      el.closest('tr, .list-group-item, div[class*="project"], li')
+    )
+    .catch(() => null);
+  return rowHandle?.asElement ? rowHandle.asElement() : null;
+}
+
+async function trySearchProject(page, projectName) {
+  const search = page
+    .locator(
+      'input[placeholder*="search" i], input[placeholder*="検索"], input[type="search"], .input-group input[type="text"], input[type="text"][name*="search" i]'
+    )
+    .first();
+  if ((await search.count().catch(() => 0)) === 0) return false;
+  await search.fill("").catch(() => {});
+  await search.fill(projectName).catch(() => {});
+  await page.waitForTimeout(800);
+  return true;
+}
+
+async function waitForProjectInList(
+  page,
+  baseUrl,
+  projectName,
+  timeoutMs = 30000
+) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await goToProjectList(page);
+    await page.waitForTimeout(1000);
+    await trySearchProject(page, projectName);
+    const count = await page
+      .locator(`text=${projectName}`)
+      .count()
+      .catch(() => 0);
+    if (count === 1) return true;
+    await page.waitForTimeout(1500);
+  }
+  return false;
+}
+
+async function waitForProjectGone(
+  page,
+  baseUrl,
+  projectName,
+  timeoutMs = 30000
+) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await goToProjectList(page);
+    await page.waitForTimeout(800);
+    await trySearchProject(page, projectName);
+    const count = await page
+      .locator(`text=${projectName}`)
+      .count()
+      .catch(() => 0);
+    if (count === 0) return true;
+    await page.waitForTimeout(1500);
+  }
+  return false;
+}
+
+async function confirmDestructiveDialogIfNeeded(page, projectName) {
+  // Some delete dialogs require typing a confirmation string shown under:
+  // 「確認のため以下を入力してください」
+  const dialog = page.locator(
+    '.n-dialog, .n-modal, .modal, [role="dialog"], .dialog, .ant-modal'
+  );
+  const visible = await dialog
+    .filter({ hasText: /削除|Delete|確認|入力してください/ })
+    .first()
+    .waitFor({ state: "visible", timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!visible) return false;
+
+  const scope = dialog
+    .filter({ hasText: /削除|Delete|確認|入力してください/ })
+    .first();
+
+  const prompt = scope.locator("text=確認のため以下を入力してください").first();
+  const hasPrompt = (await prompt.count().catch(() => 0)) > 0;
+
+  let required = "";
+  if (hasPrompt) {
+    const text = await scope.innerText().catch(() => "");
+    const lines = text
+      .split(/\r?\n/)
+      .map((s) => (s || "").trim())
+      .filter(Boolean);
+    const idx = lines.findIndex((l) =>
+      l.includes("確認のため以下を入力してください")
+    );
+    if (idx >= 0) {
+      const next = lines
+        .slice(idx + 1)
+        .find(
+          (l) =>
+            l &&
+            !/^(×|削除|確認|OK|はい|Yes|キャンセル|取消|閉じる|前へ|完了)$/i.test(
+              l
+            )
+        );
+      if (next) required = next;
+    }
+  }
+  if (!required) required = projectName; // fallback
+
+  const input = scope
+    .locator('input[type="text"], input:not([type]), textarea')
+    .first();
+  if ((await input.count().catch(() => 0)) > 0) {
+    await input.fill("").catch(() => {});
+    await input.fill(required).catch(() => {});
+    await page.waitForTimeout(200);
+  }
+  return true;
+}
+
+async function deleteCiProject(page, baseUrl, projectName, expectedProjectId) {
+  // SAFETY FIRST:
+  // - Only delete when projectName matches exactly one entry (count==1)
+  // - If expectedProjectId is provided and can be decoded, require it to match
+  // - Never delete anything else
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" }).catch(() => {});
+  await page.waitForLoadState("networkidle").catch(() => {});
+  await goToProjectList(page);
+  await page.waitForTimeout(1200);
+  await trySearchProject(page, projectName);
+
+  // Sometimes list is eventually consistent; wait a bit (still guarded by count==1)
+  if (
+    (await page
+      .locator(`text=${projectName}`)
+      .count()
+      .catch(() => 0)) === 0
+  ) {
+    await waitForProjectInList(page, baseUrl, projectName, 30000).catch(
+      () => false
+    );
+    await trySearchProject(page, projectName);
+  }
+
+  const matches = await page
+    .locator(`text=${projectName}`)
+    .count()
+    .catch(() => 0);
+  if (matches !== 1) {
+    throw new Error(
+      `削除ガード: プロジェクト名 "${projectName}" の一致件数が1件ではありません (count=${matches})`
+    );
+  }
+
+  const row = await findProjectRowHandle(page, projectName);
+  if (!row)
+    throw new Error(
+      `削除対象プロジェクト行が見つかりませんでした: ${projectName}`
+    );
+
+  const uiLink = await row
+    .$(
+      'a[href*="/programManagement"][title="UI"], a[href*="/programManagement"]'
+    )
+    .catch(() => null);
+  const href = uiLink
+    ? await uiLink.getAttribute("href").catch(() => null)
+    : null;
+  const pid = parseProjectIdFromProgramManagementHref(href, baseUrl);
+  if (expectedProjectId && pid && String(pid) !== String(expectedProjectId)) {
+    throw new Error(
+      `削除ガード: projectId が一致しません (expected=${expectedProjectId}, actual=${pid})`
+    );
+  }
+
+  // Open menu (ellipsis/dropdown) and click delete
+  const ellipsis = await row
+    .$(
+      'button[aria-label="more"], button[aria-label="More"], .fa-ellipsis-h, .fa-ellipsis-v, .dropdown-toggle, button:has(i.fa-reorder), button:has(.fa-reorder), i.fa-reorder'
+    )
+    .catch(() => null);
+  if (ellipsis) {
+    await ellipsis.click().catch(() => {});
+  } else {
+    // fallback: try clicking any visible ellipsis near the project name
+    await page
+      .locator(`text=${projectName}`)
+      .locator(
+        'xpath=ancestor::*[self::tr or self::li or self::div][1]//*[contains(@class,"fa-ellipsis")]'
+      )
+      .first()
+      .click({ force: true })
+      .catch(() => {});
+  }
+  await page.waitForTimeout(500);
+
+  const deleteBtn = page
+    .locator(
+      '.n-dropdown-option:has-text("削除"), .n-dropdown-option:has-text("Delete"), .n-dropdown-option:has-text("REMOVE"), .dropdown-menu a:has-text("削除"), .dropdown-menu button:has-text("削除"), .dropdown-menu a:has-text("Delete"), button:has-text("削除"), a:has-text("削除"), button:has-text("Delete"), a:has-text("Delete")'
+    )
+    .first();
+  if ((await deleteBtn.count().catch(() => 0)) === 0) {
+    // Fallback: open project detail page and delete from there (still guarded by name uniqueness + id check)
+    await page
+      .screenshot({
+        path: `debug-project-delete-no-action-${safeChecklistKey(
+          projectName,
+          60
+        )}.png`,
+        fullPage: true,
+      })
+      .catch(() => {});
+    const html = await page.content().catch(() => "");
+    if (html) {
+      fs.writeFileSync(
+        `debug-project-delete-no-action-${safeChecklistKey(
+          projectName,
+          60
+        )}.html`,
+        html
+      );
+    }
+
+    await page
+      .locator(`text=${projectName}`)
+      .first()
+      .click({ force: true })
+      .catch(() => {});
+    await page.waitForLoadState("domcontentloaded").catch(() => {});
+    await page.waitForTimeout(800);
+
+    const pid2 = parseProjectIdFromSParamUrl(page.url(), baseUrl);
+    if (
+      expectedProjectId &&
+      pid2 &&
+      String(pid2) !== String(expectedProjectId)
+    ) {
+      throw new Error(
+        `削除ガード(detail): projectId が一致しません (expected=${expectedProjectId}, actual=${pid2})`
+      );
+    }
+
+    const deleteOnDetail = page
+      .locator(
+        'button:has-text("削除"), a:has-text("削除"), button:has-text("Delete"), a:has-text("Delete"), button:has(i.fa-trash), button:has(.fa-trash)'
+      )
+      .first();
+    if ((await deleteOnDetail.count().catch(() => 0)) === 0) {
+      throw new Error(
+        "削除アクションが見つかりませんでした（他のプロジェクトは削除しません）"
+      );
+    }
+    await deleteOnDetail.click({ force: true }).catch(() => {});
+
+    await confirmDestructiveDialogIfNeeded(page, projectName).catch(() => {});
+    const confirm2 = page
+      .locator(
+        'button:has-text("削除"), button:has-text("確認"), button:has-text("OK")'
+      )
+      .first();
+    if ((await confirm2.count().catch(() => 0)) > 0) {
+      await confirm2.click({ force: true }).catch(() => {});
+    }
+    await page.waitForTimeout(1500);
+
+    // Verify deletion from list
+    await page.goto(baseUrl, { waitUntil: "networkidle" }).catch(() => {});
+    await goToProjectList(page);
+    await page.waitForTimeout(1000);
+    await trySearchProject(page, projectName);
+    const still2 = await page
+      .locator(`text=${projectName}`)
+      .count()
+      .catch(() => 0);
+    if (still2 !== 0)
+      throw new Error(`プロジェクト削除後も残っています: ${projectName}`);
+    return true;
+  }
+  await deleteBtn.click({ force: true }).catch(() => {});
+
+  // Confirm
+  await confirmDestructiveDialogIfNeeded(page, projectName).catch(() => {});
+  const confirm = page
+    .locator(
+      'button:has-text("削除"), button:has-text("確認"), button:has-text("OK"), button:has-text("はい"), button:has-text("Yes"), button:has-text("YES")'
+    )
+    .first();
+  if ((await confirm.count().catch(() => 0)) > 0) {
+    await confirm.click({ force: true }).catch(() => {});
+  }
+  await page.waitForTimeout(1500);
+  await waitForProjectGone(page, baseUrl, projectName, 30000).catch(
+    () => false
+  );
+
+  // Verify deletion
+  const still = await page
+    .locator(`text=${projectName}`)
+    .count()
+    .catch(() => 0);
+  if (still !== 0)
+    throw new Error(`プロジェクト削除後も残っています: ${projectName}`);
+  return true;
+}
+
 // プロジェクト自動作成処理（tryの外に定義）
 async function createProject(page, projectName) {
   // プロジェクトメニューをクリック
@@ -1718,7 +2100,7 @@ async function createProject(page, projectName) {
       console.log(
         `既に${projectName}プロジェクトが存在するため作成をスキップします。`
       );
-      return;
+      return { created: false, name: projectName };
     }
 
     // 「新しいプロジェクトを作成」ボタンを探してクリック
@@ -1819,6 +2201,73 @@ async function createProject(page, projectName) {
             // ここでは "プロジェクト...を自動作成しました" と出す前に少し待つ
             await page.waitForTimeout(5000);
             console.log(`プロジェクト「${projectName}」を自動作成しました。`);
+
+            // モーダルが閉じない場合は作成失敗の可能性が高い（バリデーション等）
+            const modalClosed = await modalDialog
+              .first()
+              .waitFor({ state: "hidden", timeout: 15000 })
+              .then(() => true)
+              .catch(() => false);
+            if (!modalClosed) {
+              const modalText = await modalDialog
+                .first()
+                .innerText()
+                .catch(() => "");
+              console.error(
+                "プロジェクト作成モーダルが閉じませんでした（作成失敗の可能性）"
+              );
+              if (modalText) console.error("Modal text:", modalText);
+              await page
+                .screenshot({
+                  path: `debug-project-create-modal-not-closed-${safeChecklistKey(
+                    projectName,
+                    60
+                  )}.png`,
+                  fullPage: true,
+                })
+                .catch(() => {});
+              return {
+                created: false,
+                name: projectName,
+                error: "modal_not_closed",
+              };
+            }
+
+            await page.waitForTimeout(1200);
+            // Refresh once: project list sometimes doesn't update immediately.
+            await page.reload({ waitUntil: "networkidle" }).catch(() => {});
+            await goToProjectList(page);
+            await page.waitForTimeout(800);
+            await trySearchProject(page, projectName);
+            const baseUrl = new URL(page.url()).origin;
+            const ok = await waitForProjectInList(
+              page,
+              baseUrl,
+              projectName,
+              30000
+            ).catch(() => false);
+            const found = await page
+              .locator(`text=${projectName}`)
+              .count()
+              .catch(() => 0);
+            if (!ok || found !== 1) {
+              await page
+                .screenshot({
+                  path: `debug-project-create-not-found-${safeChecklistKey(
+                    projectName,
+                    60
+                  )}.png`,
+                  fullPage: true,
+                })
+                .catch(() => {});
+              return {
+                created: false,
+                name: projectName,
+                foundCount: found,
+                error: "created_but_not_listed",
+              };
+            }
+            return { created: true, name: projectName, foundCount: found };
           } else {
             console.log(
               "完了ボタンが見つかりませんでした。スクリーンショットを保存します。"
@@ -1850,11 +2299,16 @@ async function createProject(page, projectName) {
   } else {
     console.log("プロジェクトメニューが見つかりませんでした。");
   }
+  return { created: false, name: projectName, error: "create_failed" };
 }
 
 // プロジェクト詳細画面へ遷移する (UI管理画面へ)
-async function openProjectDetail(page, projectName) {
+async function openProjectDetail(page, projectName, baseUrl) {
   // プロジェクト一覧で該当プロジェクトを探す
+  await page.goto(baseUrl, { waitUntil: "networkidle" }).catch(() => {});
+  await goToProjectList(page);
+  await page.waitForTimeout(1200);
+  await trySearchProject(page, projectName);
   await page.waitForTimeout(2000); // 一覧描画待ち
 
   // リスト表示とグリッド表示の両方に対応するため、テキストで探す
@@ -1878,8 +2332,13 @@ async function openProjectDetail(page, projectName) {
 
       if (uiLink) {
         console.log("UI管理画面へのリンクをクリックします。");
+        const href = await uiLink.getAttribute("href").catch(() => null);
+        const projectId = parseProjectIdFromProgramManagementHref(
+          href,
+          baseUrl
+        );
         await uiLink.click();
-        return true;
+        return { ok: true, projectId, name: projectName };
       }
 
       // リンクがない場合 (権限不足や構造違い)
@@ -1908,12 +2367,12 @@ async function openProjectDetail(page, projectName) {
       // 最終手段: タイトルクリック (ただしこれは展開しかしない可能性大)
       console.log("タイトルをクリックしてみます。");
       await projectElement.click();
-      return true;
+      return { ok: true, projectId: null, name: projectName };
     }
   } else {
     console.log(`プロジェクト「${projectName}」が見つかりませんでした。`);
   }
-  return false;
+  return { ok: false, projectId: null, name: projectName };
 }
 
 // プロジェクト内部の自動化処理
@@ -2961,23 +3420,54 @@ async function waitForManualLogin(page, timeoutMs) {
     }
     // === ここまで ===
 
-    // プロジェクト自動作成処理は必ず実行
-    await createProject(page, "CIテスト");
+    // プロジェクト自動作成処理（CI向け: この実行で作成したものだけ削除したい）
+    const projectBaseName = getArg("--project-name") || "CIテスト";
+    const reuseProject = hasFlag("--reuse-project");
+    const shouldAutoDeleteProject =
+      hasFlag("--autodelete-project") || isTestModeRequested;
+    const projectRunId = nowTag();
+    const projectRunKey = projectRunId.replace(/\D/g, ""); // avoid separators to satisfy "word count <= 30" validation
+    const projectName =
+      shouldAutoDeleteProject && !reuseProject
+        ? `${projectBaseName}削除用${projectRunKey}`
+        : projectBaseName;
+
+    const createdInfo = await createProject(page, projectName);
+    const projectPrepareOk = !!createdInfo && !createdInfo.error;
+    emitChecklist("ci_project_create", projectPrepareOk);
+    if (isTestModeRequested && !projectPrepareOk) process.exitCode = 1;
+
     // プロジェクト詳細画面を開く処理
-    if (await openProjectDetail(page, "CIテスト")) {
+    const opened = await openProjectDetail(page, projectName, baseUrl);
+    if (opened?.ok) {
       // 詳細画面に入れたら、内部操作の自動化を実行
       await automateProjectInternal(page);
+    } else if (isTestModeRequested) {
+      process.exitCode = 1;
     }
+
+    // keep for later deletion (ONLY if created in this run)
+    var ciProject = {
+      name: projectName,
+      created: !!createdInfo?.created,
+      projectId: opened?.projectId || null,
+      shouldDelete:
+        !!createdInfo?.created && shouldAutoDeleteProject && !reuseProject,
+    };
   } catch (e) {
     console.log("サイドバーのリンクが取得できませんでした:", e.message);
-    await browser.close();
-    process.exit(1);
+    process.exitCode = 1;
   }
 
   // 各リンクをクロールしてリンク切れをチェック
   const brokenLinks = [];
   // NOTE: baseUrl は上で定義済み（CLIで変更可能）
+  let linkCheckAborted = false;
   for (const link of links) {
+    if (page.isClosed()) {
+      linkCheckAborted = true;
+      break;
+    }
     // ダミーリンクは除外
     if (
       !link.href ||
@@ -3016,10 +3506,24 @@ async function waitForManualLogin(page, timeoutMs) {
       );
     }
     // 元のページに戻る
-    await page.goto(baseUrl, {
-      waitUntil: "domcontentloaded",
-    });
-    await page.waitForLoadState("networkidle");
+    try {
+      if (page.isClosed()) {
+        linkCheckAborted = true;
+        break;
+      }
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page.waitForLoadState("networkidle");
+    } catch (e) {
+      // If the page/context was closed, abort further link checks.
+      linkCheckAborted = true;
+      brokenLinks.push({
+        href: baseUrl,
+        text: "(back_to_base)",
+        status: "Error",
+        error: e?.message || String(e),
+      });
+      break;
+    }
   }
 
   // 結果をまとめて表示
@@ -3037,7 +3541,7 @@ async function waitForManualLogin(page, timeoutMs) {
   }
 
   // checklist items (stdout only): overall + failures only
-  emitChecklist("link_check", brokenLinks.length === 0);
+  emitChecklist("link_check", !linkCheckAborted && brokenLinks.length === 0);
   for (const bl of brokenLinks) {
     emitChecklist(`link_broken.${safeChecklistKey(bl.href)}`, false);
   }
@@ -3046,7 +3550,27 @@ async function waitForManualLogin(page, timeoutMs) {
     emitChecklist(`chinese.${safeChecklistKey(cf.menuText)}`, false);
   }
 
+  // Delete CI project created in this run (never delete other projects)
+  if (typeof ciProject !== "undefined" && ciProject?.shouldDelete) {
+    try {
+      // Use a fresh page for deletion to avoid "page closed" issues after designer flows.
+      const delPage = await page.context().newPage();
+      await deleteCiProject(
+        delPage,
+        baseUrl,
+        ciProject.name,
+        ciProject.projectId
+      );
+      await delPage.close().catch(() => {});
+      emitChecklist("ci_project_delete", true);
+    } catch (e) {
+      console.error("CIプロジェクト削除に失敗:", e?.message || e);
+      emitChecklist("ci_project_delete", false);
+      process.exitCode = 1;
+    }
+  }
+
   // ブラウザを閉じてプロセスを終了
   await browser.close();
-  process.exit(0);
+  process.exit(process.exitCode || 0);
 })();
