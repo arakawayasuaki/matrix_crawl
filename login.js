@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 const { chromium } = require("playwright");
 const tls = require("tls");
 const url = require("url");
@@ -26,6 +26,51 @@ function getArg(flag) {
 
 function hasFlag(flag) {
   return process.argv.includes(flag);
+}
+
+// =========================
+// Output mode
+// =========================
+const CHECKLIST_MODE =
+  hasFlag("--checklist") ||
+  String(process.env.NTMATRIX_CHECKLIST || "") === "1";
+
+function formatForLog(x) {
+  if (typeof x === "string") return x;
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return String(x);
+  }
+}
+
+function setupChecklistMode() {
+  if (!CHECKLIST_MODE) return;
+  const toStderr = (...args) => {
+    try {
+      process.stderr.write(args.map(formatForLog).join(" ") + "\n");
+    } catch {
+      // ignore
+    }
+  };
+  // Ensure stdout only contains "item OK/NG". Everything else goes to stderr.
+  console.log = toStderr;
+  console.info = toStderr;
+  console.warn = toStderr;
+}
+
+function emitChecklist(item, ok) {
+  if (!CHECKLIST_MODE) return;
+  process.stdout.write(`${item}\t${ok ? "OK" : "NG"}\n`);
+}
+
+function emitChecklistFromSteps(prefix, steps) {
+  if (!CHECKLIST_MODE) return;
+  if (!Array.isArray(steps)) return;
+  for (const s of steps) {
+    if (!s || !s.step) continue;
+    emitChecklist(`${prefix}.${s.step}`, !!s.ok);
+  }
 }
 
 function parseCookieHeader(cookieHeader) {
@@ -1370,6 +1415,7 @@ async function testBehaviorSmoke(page) {
   );
   if (!result.ok) process.exitCode = 1;
   console.log(`Behavior smoke summary: ${path.join(outDir, "summary.json")}`);
+  return result;
 }
 
 async function getComponentCatalog(page) {
@@ -1466,6 +1512,7 @@ async function testAllComponents(page) {
 
       const ok = afterCount > beforeCount;
       results.push({ name, ok, beforeCount, afterCount });
+      emitChecklist(`component.${name}`, ok);
 
       if (!ok) {
         await page
@@ -1505,12 +1552,21 @@ async function testAllComponents(page) {
   );
 
   const failed = results.filter((r) => !r.ok);
+  emitChecklist("test_all_components", failed.length === 0);
   if (failed.length > 0) {
     console.error(`Component test failed: ${failed.length}/${results.length}`);
     process.exitCode = 1;
   } else {
     console.log(`Component test passed: ${results.length}/${results.length}`);
   }
+  return {
+    runId,
+    url: page.url(),
+    total: results.length,
+    passed: results.filter((r) => r.ok).length,
+    failed: failed.length,
+    results,
+  };
 }
 
 async function applyCookiesToContext(context, baseUrl) {
@@ -1909,7 +1965,9 @@ async function automateProjectInternal(page) {
           console.log(
             "Running behavior smoke test (based on matrix.md 2.4)..."
           );
-          await testBehaviorSmoke(page);
+          const r = await testBehaviorSmoke(page);
+          emitChecklist("behavior_smoke", !!r?.ok);
+          emitChecklistFromSteps("behavior_smoke", r?.steps);
           return;
         }
 
@@ -2110,7 +2168,9 @@ async function automateProjectInternal(page) {
           console.log(
             "Running behavior smoke test (based on matrix.md 2.4)..."
           );
-          await testBehaviorSmoke(page);
+          const r = await testBehaviorSmoke(page);
+          emitChecklist("behavior_smoke", !!r?.ok);
+          emitChecklistFromSteps("behavior_smoke", r?.steps);
           return;
         }
 
@@ -2505,6 +2565,8 @@ async function waitForManualLogin(page, timeoutMs) {
     hasFlag("--behavior-strict-datamodel-bind") ||
     hasFlag("--ci-datamodel");
 
+  setupChecklistMode();
+
   let browser = await chromium.launch({ headless });
 
   // StorageStateの読み込み設定
@@ -2568,6 +2630,7 @@ async function waitForManualLogin(page, timeoutMs) {
           );
           process.exitCode = 1;
         }
+        emitChecklist("login", false);
         await browser.close().catch(() => {});
         return;
       }
@@ -2600,6 +2663,7 @@ async function waitForManualLogin(page, timeoutMs) {
           "ログイン完了を確認できませんでした（timeout）。storage.json は更新せずに終了します。"
         );
         process.exitCode = 1;
+        emitChecklist("login", false);
         await browser.close().catch(() => {});
         return;
       }
@@ -2611,6 +2675,7 @@ async function waitForManualLogin(page, timeoutMs) {
         await page.goto(homeUrl);
         await page.waitForLoadState("networkidle");
       }
+      emitChecklist("login", true);
       // 以降はこの headed セッションで続行
     }
 
@@ -2626,6 +2691,7 @@ async function waitForManualLogin(page, timeoutMs) {
         "ログイン完了を確認できませんでした（timeout）。storage.json は更新せずに終了します。"
       );
       process.exitCode = 1;
+      emitChecklist("login", false);
       await browser.close().catch(() => {});
       return;
     }
@@ -2637,8 +2703,10 @@ async function waitForManualLogin(page, timeoutMs) {
       await page.goto(homeUrl);
       await page.waitForLoadState("networkidle");
     }
+    emitChecklist("login", true);
   } else {
     console.log("ログイン済みです。スキップします。");
+    emitChecklist("login", true);
   }
 
   console.log("Current URL:", page.url());
